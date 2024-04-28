@@ -40,15 +40,30 @@ else
 endif
 
 # PHONY means these targets will always be executed
-.PHONY: all train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu
+.PHONY: all train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu infer test_infer cached_infer
 
 # default target is all
-all: train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu
+all: train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu infer test_infer cached_infer
 
 train_gpt2: train_gpt2.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -o $@
 
+train_scratch: train_scratch.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -o $@
+
 test_gpt2: test_gpt2.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -o $@
+
+test_infer: test_infer.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -o $@
+
+infer: infer.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -o $@
+
+cached_infer: cached_infer.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -o $@
+
+test_kv_cache: test_kv_cache.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -o $@
 
 # possibly may want to disable warnings? e.g. append -Xcompiler -Wno-unused-result
@@ -59,5 +74,5 @@ test_gpt2cu: test_gpt2.cu
 	nvcc -O3 --use_fast_math $< -lcublas -lcublasLt -o $@
 
 clean:
-	rm -f train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu
+	rm -f train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu infer test_infer cached_infer
 

@@ -10,9 +10,6 @@ There will be other versions of this code that specialize it and make it fast.
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <ctype.h>
-#include <stdint.h>
-#include <assert.h>
 #include <math.h>
 #include <time.h>
 #include <string.h>
@@ -153,6 +150,7 @@ void layernorm_backward(float* dinp, float* dweight, float* dbias,
     }
 }
 
+// matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
 void matmul_forward(float* out,
                     float* inp, float* weight, float* bias,
                     int B, int T, int C, int OC) {
@@ -363,11 +361,6 @@ void gelu_forward(float* out, float* inp, int N) {
     }
 }
 
-// we want to use -Ofast optimization, but sadly GeLU breaks, so disable this flag just for it (#168)
-#pragma float_control(precise, on, push)
-#if defined(__GNUC__) && !defined(__clang__)
-__attribute__((optimize("no-finite-math-only")))
-#endif
 void gelu_backward(float* dinp, float* inp, float* dout, int N) {
     for (int i = 0; i < N; i++) {
         float x = inp[i];
@@ -380,7 +373,6 @@ void gelu_backward(float* dinp, float* inp, float* dout, int N) {
         dinp[i] += local_grad * dout[i];
     }
 }
-#pragma float_control(pop)
 
 void residual_forward(float* out, float* inp1, float* inp2, int N) {
     for (int i = 0; i < N; i++) {
@@ -561,12 +553,16 @@ typedef struct {
 } GPT2Config;
 
 typedef struct {
+    
+} kv_cache;
+
+typedef struct {
     GPT2Config config;
     // the weights (parameters) of the model, and their sizes
     ParameterTensors params;
     size_t param_sizes[NUM_PARAMETER_TENSORS];
     float* params_memory;
-    size_t num_parameters;
+    int num_parameters;
     // gradients of the weights
     ParameterTensors grads;
     float* grads_memory;
@@ -577,7 +573,7 @@ typedef struct {
     ActivationTensors acts;
     size_t act_sizes[NUM_ACTIVATION_TENSORS];
     float* acts_memory;
-    size_t num_activations;
+    int num_activations;
     // gradients of the activations
     ActivationTensors grads_acts;
     float* grads_acts_memory;
@@ -587,9 +583,11 @@ typedef struct {
     int* inputs; // the input tokens for the current forward pass
     int* targets; // the target tokens for the current forward pass
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
+
+    
 } GPT2;
 
-void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
+void gpt2_build_from_checkpoint(GPT2 *model, char* checkpoint_path) {
 
     // read in model from a checkpoint file
     FILE *model_file = fopen(checkpoint_path, "rb");
@@ -600,18 +598,18 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     if (model_header[1] != 1) { printf("Bad version in model file"); exit(1); }
 
     // read in hyperparameters
-    size_t maxT, V, L, NH, C; // size_t to prevent int overflow
+    int maxT, V, L, NH, C;
     model->config.max_seq_len = maxT = model_header[2];
     model->config.vocab_size = V = model_header[3];
     model->config.num_layers = L = model_header[4];
     model->config.num_heads = NH = model_header[5];
     model->config.channels = C = model_header[6];
     printf("[GPT-2]\n");
-    printf("max_seq_len: %zu\n", maxT);
-    printf("vocab_size: %zu\n", V);
-    printf("num_layers: %zu\n", L);
-    printf("num_heads: %zu\n", NH);
-    printf("channels: %zu\n", C);
+    printf("max_seq_len: %d\n", maxT);
+    printf("vocab_size: %d\n", V);
+    printf("num_layers: %d\n", L);
+    printf("num_heads: %d\n", NH);
+    printf("channels: %d\n", C);
 
     // allocate space for all the parameters and read them in
     model->param_sizes[0] = V * C; // wte
@@ -631,7 +629,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->param_sizes[14] = C; // lnfw
     model->param_sizes[15] = C; // lnfb
 
-    // count the number of parameters
+    // cound the number of paramaters
     size_t num_parameters = 0;
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         num_parameters += model->param_sizes[i];
@@ -657,7 +655,7 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->mean_loss = -1.0f; // -1.0f will designate no loss
 }
 
-void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
+void gpt2_forward(GPT2 *model, int* inputs, int* targets, int B, int T) {
     // targets are optional and could be NULL
 
     // ensure the model was initialized or error out
@@ -666,19 +664,11 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         exit(1);
     }
 
-    // convenience parameters (size_t to help prevent int overflow)
-    size_t V = model->config.vocab_size;
-    size_t L = model->config.num_layers;
-    size_t NH = model->config.num_heads;
-    size_t C = model->config.channels;
-
-    // validate inputs, all indices must be in the range [0, V)
-    for(int i = 0; i < B * T; i++) {
-        assert(0 <= inputs[i] && inputs[i] < V);
-        if (targets != NULL) {
-            assert(0 <= targets[i] && targets[i] < V);
-        }
-    }
+    // convenience parameters
+    int V = model->config.vocab_size;
+    int L = model->config.num_layers;
+    int NH = model->config.num_heads;
+    int C = model->config.channels;
 
     // allocate space for all the activations if needed (done here, lazily)
     if(model->acts_memory == NULL) {
@@ -713,18 +703,19 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
             num_activations += model->act_sizes[i];
         }
-        // printf("num_activations: %zu\n", num_activations);
+        printf("num_activations: %zu\n", num_activations);
         model->num_activations = num_activations;
         model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
         // also create memory for caching inputs and targets
         model->inputs = (int*)malloc(B * T * sizeof(int));
         model->targets = (int*)malloc(B * T * sizeof(int)); // might be unused if we never have targets but it's small
     } else {
-        // validate B,T is consistent with how we've allocated the memory before
-        // in principle we could get more clever here in the future, for now this is safest
-        if (B != model->batch_size || T != model->seq_len) {
-            printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, (int)B, (int)T);
-            exit(EXIT_FAILURE);
+        // validate B,T is no larger than what was previously allocated
+        // in principle, we could re-allocate a larger chunk of memory, for now we just error out
+        if (B > model->batch_size || T > model->seq_len) {
+            printf("Error: batch size or sequence length is inadequately large\n");
+            printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, B, T);
+            exit(1);
         }
     }
 
@@ -826,13 +817,13 @@ void gpt2_backward(GPT2 *model) {
         gpt2_zero_grad(model);
     }
 
-    // convenience shortcuts (and size_t to help prevent int overflow)
-    size_t B = model->batch_size;
-    size_t T = model->seq_len;
-    size_t V = model->config.vocab_size;
-    size_t L = model->config.num_layers;
-    size_t NH = model->config.num_heads;
-    size_t C = model->config.channels;
+    // convenience shortcuts
+    int B = model->batch_size;
+    int T = model->seq_len;
+    int V = model->config.vocab_size;
+    int L = model->config.num_layers;
+    int NH = model->config.num_heads;
+    int C = model->config.channels;
 
     // backward pass: go in the reverse order of the forward pass, and call backward() functions
     ParameterTensors params = model->params; // for brevity
@@ -928,7 +919,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
         model->v_memory = (float*)calloc(model->num_parameters, sizeof(float));
     }
 
-    for (size_t i = 0; i < model->num_parameters; i++) {
+    for (int i = 0; i < model->num_parameters; i++) {
         float param = model->params_memory[i];
         float grad = model->grads_memory[i];
 
@@ -981,7 +972,7 @@ typedef struct {
     int num_batches;
 } DataLoader;
 
-void dataloader_init(DataLoader *loader, const char* filename, int B, int T) {
+void dataloader_init(DataLoader *loader, char* filename, int B, int T) {
     loader->B = B;
     loader->T = T;
 
@@ -1063,87 +1054,6 @@ int sample_mult(float* probabilities, int n, float coin) {
 }
 
 // ----------------------------------------------------------------------------
-// Tokenizer (only supports decoding)
-
-typedef struct {
-    uint32_t vocab_size;
-    char **token_table;
-    int init_ok;
-} Tokenizer;
-
-void safe_printf(const char *piece) {
-    // the tokens are raw bytes, and we we only want to print the printable ones
-    // many bytes can be various control codes, backspace, etc.
-    if (piece == NULL) { return; }
-    if (piece[0] == '\0') { return; }
-    // handle individual byte tokens
-    // every token is asserted to be at least one byte so doing piece[1] is ok
-    if (piece[1] == '\0') {
-        unsigned char byte_val = piece[0];
-        if (!(isprint(byte_val) || isspace(byte_val))) {
-            return; // weird byte, don't print it
-        }
-    }
-    printf("%s", piece);
-}
-
-void tokenizer_init(Tokenizer *tokenizer, const char *filename) {
-    FILE *file = fopen(filename, "rb");
-    if (file == NULL) {
-        // try to be more helpful as we just added this feature, erase later
-        printf("---\n");
-        printf("WARNING: Failed to open the tokenizer file %s\n", filename);
-        printf("The Tokenizer is a new feature added April 14 2024.\n");
-        printf("Re-run `python train_gpt2.py` to write it\n");
-        printf("---\n");
-        tokenizer->init_ok = 0;
-        return;
-    }
-    // read in the header
-    uint32_t header[256];
-    fread(header, sizeof(uint32_t), 256, file);
-    assert(header[0] == 20240328);
-    assert(header[1] == 1);
-    tokenizer->vocab_size = header[2];
-    // read in all the tokens
-    unsigned char length;
-    tokenizer->token_table = (char **)malloc(tokenizer->vocab_size * sizeof(char *));
-    for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
-        fread(&length, sizeof(unsigned char), 1, file);
-        assert(length > 0); // every token should be at least one character
-        char *token_bytes = (char *)malloc(length + 1);
-        fread(token_bytes, sizeof(char), length, file);
-        token_bytes[length] = '\0';  // Add null terminator for printing
-        tokenizer->token_table[i] = token_bytes;
-    }
-    // cleanups
-    fclose(file);
-    tokenizer->init_ok = 1;
-}
-
-const char *tokenizer_decode(Tokenizer *tokenizer, uint32_t token_id) {
-    if (tokenizer->init_ok == 0) {
-        return NULL;
-    }
-    if (token_id < tokenizer->vocab_size) {
-        return tokenizer->token_table[token_id];
-    } else {
-        printf("invalid token id %d!\n", token_id);
-        return NULL;
-    }
-}
-
-void tokenizer_free(Tokenizer *tokenizer) {
-    if (tokenizer->init_ok) {
-        for (uint32_t i = 0; i < tokenizer->vocab_size; i++) {
-            free(tokenizer->token_table[i]);
-        }
-        free(tokenizer->token_table);
-    }
-}
-
-#ifndef INFERENCE
-// ----------------------------------------------------------------------------
 // main training loop
 int main() {
 
@@ -1152,12 +1062,12 @@ int main() {
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
 
     // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
-    const char* tiny_stories_train = "data/TinyStories_train.bin";
-    const char* tiny_stories_val = "data/TinyStories_val.bin";
-    const char* tiny_shakespeare_train = "data/tiny_shakespeare_train.bin";
-    const char* tiny_shakespeare_val = "data/tiny_shakespeare_val.bin";
-    const char* train_tokens = access(tiny_shakespeare_train, F_OK) != -1 ? tiny_shakespeare_train : tiny_stories_train;
-    const char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
+    char* tiny_stories_train = "data/TinyStories_train.bin";
+    char* tiny_stories_val = "data/TinyStories_val.bin";
+    char* tiny_shakespeare_train = "data/tiny_shakespeare_train.bin";
+    char* tiny_shakespeare_val = "data/tiny_shakespeare_val.bin";
+    char* train_tokens = access(tiny_shakespeare_train, F_OK) != -1 ? tiny_shakespeare_train : tiny_stories_train;
+    char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
     int B = 4; // batch size 4 (i.e. 4 independent token sequences will be trained on)
     int T = 64; // sequence length 64 (i.e. each sequence is 64 tokens long). must be <= maxT, which is 1024 for GPT-2
     DataLoader train_loader;
@@ -1166,20 +1076,16 @@ int main() {
     DataLoader val_loader;
     dataloader_init(&val_loader, val_tokens, B, T);
     printf("val dataset num_batches: %d\n", val_loader.num_batches);
-    int val_num_batches = 5;
-
-    // build the Tokenizer
-    Tokenizer tokenizer;
-    tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
+    int val_num_batches = 10;
 
     // some memory for generating samples from the model
     unsigned long long rng_state = 1337;
-    int* gen_tokens = (int*)malloc(B * T * sizeof(int));
-    const int genT = 64; // number of steps of inference we will do
+    const int gen_max_length = 64; // during inference step we'll generate sequences of this many tokens
+    int gen_tokens[gen_max_length];
 
     // train
     struct timespec start, end;
-    for (int step = 0; step <= 40; step++) {
+    for (int step = 0; step <= 20; step++) {
 
         // once in a while estimate the validation loss
         if (step % 10 == 0) {
@@ -1195,39 +1101,36 @@ int main() {
         }
 
         // once in a while do model inference to print generated text
-        if (step > 0 && step % 20 == 0) {
-            // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
-            for(int i = 0; i < B * T; ++i) {
-                gen_tokens[i] = GPT2_EOT;
-            }
-            // now sample from the model autoregressively
-            printf("generating:\n---\n");
-            for (int t = 1; t < genT; t++) {
-                // note that inference is very wasteful here because for each token
-                // we re-calculate the forward pass for all of (B,T) positions from scratch
-                // but the inference here is just for sanity checking anyway
-                // and we can maybe optimize a bit more later, with careful tests
-                gpt2_forward(&model, gen_tokens, NULL, B, T);
-                // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
-                // we're in principle running B "inference streams" in parallel here
-                // but only using position 0
-                // get the V-dimensional vector probs[0, t-1, :]
+        if (step > 0 && step % 1 == 0) {
+            gen_tokens[0] = GPT2_EOT; // the GPT-2 EOT token kicks off the generation
+            for (int t = 1; t < gen_max_length; t++) {
+                // note that inference is wasteful here because
+                // for each t, we re-compute all activations between 0 and t
+                // leaving this alone because you want separate code for inference anyway
+                // the inference here is just for sanity checking purposes
+                gpt2_forward(&model, gen_tokens, NULL, 1, t);
                 float* probs = model.acts.probs + (t-1) * model.config.vocab_size;
                 float coin = random_f32(&rng_state);
                 int next_token = sample_mult(probs, model.config.vocab_size, coin);
                 gen_tokens[t] = next_token;
-                // print the generated token, either using the Tokenizer or a fallback
-                if (tokenizer.init_ok) {
-                    const char* token_str = tokenizer_decode(&tokenizer, next_token);
-                    safe_printf(token_str);
-                } else {
-                    // fall back to printing the token id
-                    printf("%d ", next_token);
+                printf("generated: ");
+                for (int t = 0; t < gen_max_length; t++) {
+                    printf("%d ", gen_tokens[t]);
                 }
-                fflush(stdout);
+                printf("\n");
             }
-            printf("\n---\n");
+           // printf("generated: ");
+            //for (int t = 0; t < gen_max_length; t++) {
+            //    printf("%d ", gen_tokens[t]);
+            //}
+            //printf("\n");
         }
+
+        printf("trainloader inputs: ");
+        for (int t = 0; t < T; t++) {
+            printf("%d ", train_loader.inputs[t]);
+        }
+        printf("\n");
 
         // do a training step
         clock_gettime(CLOCK_MONOTONIC, &start);
@@ -1244,10 +1147,7 @@ int main() {
     // free
     dataloader_free(&train_loader);
     dataloader_free(&val_loader);
-    tokenizer_free(&tokenizer);
     gpt2_free(&model);
-    free(gen_tokens);
     return 0;
 }
-#endif
 #endif
