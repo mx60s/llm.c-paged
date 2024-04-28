@@ -451,6 +451,7 @@ typedef struct {
     int* targets; // the target tokens for the current forward pass
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
     float* kv_cache;
+    float* kv_cache_curr;
 } GPT2;
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
@@ -550,8 +551,9 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, si
         //printf("initializing model\n");
         use_kv_cache = 0;
 
-        //model->kv_cache = (float*)malloc(L*B*2*C*max_total * sizeof(float*));
-        model->kv_cache = (float*)malloc(L*B*2*C*T * sizeof(float*));
+        model->kv_cache = (float*)malloc(L*B*2*C*max_total * sizeof(float*));
+        //model->kv_cache = (float*)malloc(L*B*2*C*T * sizeof(float*));
+        model->kv_cache_curr = model->kv_cache;
         use_kv_cache = 0; // should populate with full values
 
         // record the current B,T as well
@@ -599,6 +601,9 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, si
             exit(EXIT_FAILURE);
         }
     }
+
+    // slide kv cache window
+    model->kv_cache_curr = model->kv_cache + 2*C*B*L*curr_iter; 
 
     // cache the inputs/targets
     memcpy(model->inputs, inputs, B * T * sizeof(int));
@@ -653,15 +658,15 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, si
         //printf("finished layernorm\n");
         if (use_kv_cache) { // is indexing per layer going to be weird?
             matmul_cached(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
-            populate_kv_cache(model->kv_cache, l_qkv, B, T, C, T-1);    // add last token to cache
+            populate_kv_cache(model->kv_cache_curr, l_qkv, B, T, C, T-1);    // add last token to cache
 
             // okay so for now, we're just copying the cached values into l_qkv for use in attention_forward
             // in the future this copying will not happen -- the attention_forward will be block-wise
-            fill_from_kv_cache(l_qkv, model->kv_cache, B, T, C);
+            fill_from_kv_cache(l_qkv, model->kv_cache_curr, B, T, C);
         } else {
             // only called the first time, to populate the cache
             matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
-            populate_kv_cache(model->kv_cache, l_qkv, B, T, C, 0);
+            populate_kv_cache(model->kv_cache_curr, l_qkv, B, T, C, 0);
         }
 
         attention_forward(l_atty, l_preatt, l_att, l_qkv, B, T, C, NH);
@@ -926,7 +931,7 @@ int main(int arc, char **argv) {
     // some memory for generating samples from the model
     unsigned long long rng_state = 1337;
     int* gen_tokens = (int*)malloc(B * T * sizeof(int));
-    const int totalSize = T; // number of steps of inference we will do
+    const int totalSize = 80; // number of steps of inference we will do
     // genT can be larger than T if we slide the window
 
 
@@ -1004,7 +1009,8 @@ int main(int arc, char **argv) {
 
     // now continue with a sliding window past the context length
     for (int t = T; t < totalSize; t++) {
-        gpt2_forward(&model, gen_tokens + (t - T), NULL, B, T, totalSize, t - T);
+        //gpt2_forward(&model, gen_tokens + (t - T), NULL, B, T, totalSize, t - T);
+        gpt2_forward(&model, gen_tokens + (t - T), NULL, B, T, totalSize, 1); // 1 indicates that we should increment kv cache
         // printf("finished forward\n");
         // either T-1 or T not sure
         float* probs = model.acts.probs + (T-1) * model.config.vocab_size;

@@ -25,7 +25,7 @@ int main(int arc, char **argv) {
     // some memory for generating samples from the model
     unsigned long long rng_state = 1337;
     int* gen_tokens = (int*)malloc(B * T * sizeof(int));
-    const int totalSize = 100; // number of steps of inference we will do
+    const int totalSize = 80; // number of steps of inference we will do
     // genT can be larger than T if we slide the window
 
 
