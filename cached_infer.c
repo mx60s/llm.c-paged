@@ -153,102 +153,37 @@ void matmul_cached(float* out,
     }
 }
 
-/*
-void matmul_forward_qkv(float* out_q, float* out_k, float* out_v,
-                             float* inp, float* w_q, float* w_k, float* w_v,
-                             float* b_q, float* b_k, float* b_v,
-                             int B, int T, int C, int OC) {
+void populate_kv_cache(float* kv_cache, float* out, int B, int T, int C, int idx) {
     #pragma omp parallel for collapse(2)
     for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
-            float* inp_bt = inp + b * T * C + t * C;
-
-            // Output Q
-            float* out_q_bt = out_q + b * T * OC + t * OC;
-            for (int o = 0; o < OC; o++) {
-                float val_q = (b_q != NULL) ? b_q[o] : 0.0f;
-                float* w_q_row = w_q + o * C;
-                for (int i = 0; i < C; i++) {
-                    val_q += inp_bt[i] * w_q_row[i];
-                }
-                out_q_bt[o] = val_q;
-            }
-
-            // Output K
-            float* out_k_bt = out_k + b * T * OC + t * OC;
-            for (int o = 0; o < OC; o++) {
-                float val_k = (b_k != NULL) ? b_k[o] : 0.0f;
-                float* w_k_row = w_k + o * C;
-                for (int i = 0; i < C; i++) {
-                    val_k += inp_bt[i] * w_k_row[i];
-                }
-                out_k_bt[o] = val_k;
-            }
-
-            // Output V
-            float* out_v_bt = out_v + b * T * OC + t * OC;
-            for (int o = 0; o < OC; o++) {
-                float val_v = (b_v != NULL) ? b_v[o] : 0.0f;
-                float* w_v_row = w_v + o * C;
-                for (int i = 0; i < C; i++) {
-                    val_v += inp_bt[i] * w_v_row[i];
-                }
-                out_v_bt[o] = val_v;
+        for (int t = idx; t < T; t++) {
+            float* out_bt_k = out + b * T * 3 * C + t * 3 * C + C;
+            float* out_bt_v = out + b * T * 3 * C + t * 3 * C + 2 * C;
+            float* cache_k = kv_cache + b * T * 2 * C + t * 2 * C;
+            float* cache_v = kv_cache + b * T * 2 * C + t * 2 * C + C;
+            for (int i = 0; i < C; i++) {
+                cache_k[i] = out_bt_k[i];
+                cache_v[i] = out_bt_v[i];
             }
         }
     }
 }
 
-
-void matmul_forward_qkv_cached(float* out_q, float* out_k, float* out_v,
-                             float* inp, float* w_q, float* w_k, float* w_v,
-                             float* b_q, float* b_k, float* b_v,
-                             int B, int T, int C, int OC) {
-    // OC = C, need to change later
+void fill_from_kv_cache(float* out, float* kv_cache, int B, int T, int C) {
     #pragma omp parallel for collapse(2)
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
-            float* inp_bt = inp + b * T * C + t * C;
-
-            // Output Q
-            float* out_q_bt = out_q + b * T * OC + t * OC;
-            for (int o = 0; o < OC; o++) {
-                float val_q = (b_q != NULL) ? b_q[o] : 0.0f;
-                float* w_q_row = w_q + o * C;
-                for (int i = 0; i < C; i++) {
-                    val_q += inp_bt[i] * w_q_row[i];
-                }
-                out_q_bt[o] = val_q;
-            }
-
-            if (t == T - 1) {
-                // Output K
-                float* out_k_bt = out_k + b * T * OC + t * OC;
-                for (int o = 0; o < OC; o++) {
-                    float val_k = (b_k != NULL) ? b_k[o] : 0.0f;
-                    float* w_k_row = w_k + o * C;
-                    for (int i = 0; i < C; i++) {
-                        val_k += inp_bt[i] * w_k_row[i];
-                    }
-                    out_k_bt[o] = val_k;
-                }
-
-                // Output V
-                float* out_v_bt = out_v + b * T * OC + t * OC;
-                for (int o = 0; o < OC; o++) {
-                    float val_v = (b_v != NULL) ? b_v[o] : 0.0f;
-                    float* w_v_row = w_v + o * C;
-                    for (int i = 0; i < C; i++) {
-                        val_v += inp_bt[i] * w_v_row[i];
-                    }
-                    out_v_bt[o] = val_v;
-                }
+            float* out_bt_k = out + b * T * 3 * C + t * 3 * C + C;
+            float* out_bt_v = out + b * T * 3 * C + t * 3 * C + 2 * C;
+            float* cache_k = kv_cache + b * T * 2 * C + t * 2 * C;
+            float* cache_v = kv_cache + b * T * 2 * C + t * 2 * C + C;
+            for (int i = 0; i < C; i++) {
+                out_bt_k[i] = cache_k[i];
+                out_bt_v[i] = cache_v[i];
             }
         }
     }
 }
-*/
-
 
 void attention_forward(float* out, float* preatt, float* att,
                        float* inp,
@@ -515,6 +450,7 @@ typedef struct {
     int* inputs; // the input tokens for the current forward pass
     int* targets; // the target tokens for the current forward pass
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
+    float* kv_cache;
 } GPT2;
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
@@ -609,9 +545,15 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, si
     }
 
     int use_kv_cache = 1;
+
     if(model->acts_memory == NULL) {
-        printf("initializing model\n");
+        //printf("initializing model\n");
         use_kv_cache = 0;
+
+        //model->kv_cache = (float*)malloc(L*B*2*C*max_total * sizeof(float*));
+        model->kv_cache = (float*)malloc(L*B*2*C*T * sizeof(float*));
+        use_kv_cache = 0; // should populate with full values
+
         // record the current B,T as well
         model->batch_size = B;
         model->seq_len = T;
@@ -620,7 +562,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, si
         model->act_sizes[1] = L * B * T * C; // ln1
         model->act_sizes[2] = L * B * T;  // ln1_mean
         model->act_sizes[3] = L * B * T;  // ln1_rstd
-        model->act_sizes[4] = L * B * max_total * 3*C; // qkv
+        model->act_sizes[4] = L * B * T * 3*C; // qkv
         model->act_sizes[5] = L * B * T * C;  // atty
         model->act_sizes[6] = L * B * NH * T * T;  // preatt
         model->act_sizes[7] = L * B * NH * T * T;  // att
@@ -669,7 +611,8 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, si
     ActivationTensors acts = model->acts;
     float* residual;
     encoder_forward(acts.encoded, inputs, params.wte, params.wpe, B, T, C); // encoding goes into residual[0]
-    for (int l = 0; l < L; l++) {
+    //printf("starting layers (just one for now)\n");
+    for (int l = 0; l < 1; l++) {
 
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
@@ -691,19 +634,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, si
         float* l_ln1 = acts.ln1 + l * B * T * C;
         float* l_ln1_mean = acts.ln1_mean + l * B * T;
         float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
-        // float* l_qkv = acts.qkv + l * B * T * 3*C;
-        float* l_qkv = acts.qkv + l * B * max_total * 3*C + curr_iter * B * 3*C; // slide the window to get latest T tokens
-        
-        if (l == 0) {
-            printf("layer %d qkv\n", l);
-            float* qkv_ptr = l_qkv;
-            for (int i = B * max_total * 3*C; i < B * max_total * 3*C + C; i++) {
-                printf("%f ", *qkv_ptr);
-                qkv_ptr++;
-            }
-            printf("\n");
-        }
-
+        float* l_qkv = acts.qkv + l * B * T * 3*C;
         float* l_atty = acts.atty + l * B * T * C;
         float* l_preatt = acts.preatt + l * B * NH * T * T;
         float* l_att = acts.att + l * B * NH * T * T;
@@ -719,11 +650,20 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, si
 
         // now do the forward pass
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
-        if (use_kv_cache) {
+        //printf("finished layernorm\n");
+        if (use_kv_cache) { // is indexing per layer going to be weird?
             matmul_cached(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
-        } else { // only called the first time, to populate the cache
+            populate_kv_cache(model->kv_cache, l_qkv, B, T, C, T-1);    // add last token to cache
+
+            // okay so for now, we're just copying the cached values into l_qkv for use in attention_forward
+            // in the future this copying will not happen -- the attention_forward will be block-wise
+            fill_from_kv_cache(l_qkv, model->kv_cache, B, T, C);
+        } else {
+            // only called the first time, to populate the cache
             matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
+            populate_kv_cache(model->kv_cache, l_qkv, B, T, C, 0);
         }
+
         attention_forward(l_atty, l_preatt, l_att, l_qkv, B, T, C, NH);
         matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
         residual_forward(l_residual2, residual, l_attproj, B*T*C);
@@ -733,6 +673,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, si
         matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
         residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
     }
+
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
     matmul_forward(acts.logits, acts.lnf, params.wte, NULL, B, T, C, V);
@@ -966,7 +907,7 @@ int main(int arc, char **argv) {
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
 
-    int T = 2; // sequence length
+    int T = 30; // sequence length
     int P = 5; // parallel generations, not using this for now
     int B = 1;
 
@@ -985,7 +926,7 @@ int main(int arc, char **argv) {
     // some memory for generating samples from the model
     unsigned long long rng_state = 1337;
     int* gen_tokens = (int*)malloc(B * T * sizeof(int));
-    const int totalSize = 4; // number of steps of inference we will do
+    const int totalSize = T; // number of steps of inference we will do
     // genT can be larger than T if we slide the window
 
 
@@ -996,7 +937,7 @@ int main(int arc, char **argv) {
     
     // not stoachstic 
 
-    int PROMPT_SIZE = 1;
+    int PROMPT_SIZE = 14;
 
     printf("T (sequence length): %d\n", T);
     printf("PROMPT_SIZE: %d\n", PROMPT_SIZE);
