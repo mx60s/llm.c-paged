@@ -961,6 +961,29 @@ int* generate_tokens_from_logits(float* probs, int B, int T, int V) {
     return tokens;
 }
 
+typedef struct {
+    float* data;  // Pointer to the block's data in memory
+    int filled;   // Number of filled positions in this block
+} KVBlock;
+
+typedef struct {
+    KVBlock* blocks;    // Array of physical KV blocks
+    int num_blocks;     // Number of blocks in this array
+} KVBlockTable;
+
+KVBlock* allocate_kv_block(size_t block_size) {
+    KVBlock* block = malloc(sizeof(KVBlock));
+    block->data = malloc(sizeof(float) * block_size);
+    block->filled = 0;
+    return block;
+}
+
+void free_kv_block(KVBlock* block) {
+    free(block->data);
+    free(block);
+}
+
+
 
 int main(int arc, char **argv) {
     GPT2 model;

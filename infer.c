@@ -6,7 +6,7 @@ int main(int arc, char **argv) {
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
 
-    int T = 64; // sequence length
+    int T = 30; // sequence length
     int P = 5; // parallel generations, not using this for now
     int B = 1;
 
@@ -36,7 +36,7 @@ int main(int arc, char **argv) {
     
     // not stochastic 
 
-    int PROMPT_SIZE = 20;
+    int PROMPT_SIZE = 14;
 
     dataloader_next_batch(&val_loader);
     //dataloader_next_batch(&val_loader);
@@ -57,11 +57,13 @@ int main(int arc, char **argv) {
     for(int i = PROMPT_SIZE; i < totalSize; i++) {
         gen_tokens[i] = GPT2_EOT;
     }
-    //for (int i = 0; i < totalSize; i++) {
-    //    const char* token_str = tokenizer_decode(&tokenizer, gen_tokens[i]);
-    //    safe_printf(token_str);
-    //}
-    //fflush(stdout);
+    printf("==============Prompt:==================\n");
+    for (int i = 0; i < B * totalSize; i++) {
+        const char* token_str = tokenizer_decode(&tokenizer, gen_tokens[i]);
+        safe_printf(token_str);
+    }
+    printf("\n========================================\n");
+    fflush(stdout);
 
     // now sample from the model autoregressively
     struct timespec start, end;
