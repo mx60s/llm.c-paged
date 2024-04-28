@@ -74,6 +74,38 @@ void matmul_cached(float* out,
     }
 }
 
+void populate_kv_cache(float* kv_cache, float* out, int B, int T, int C, int idx) {
+    //#pragma omp parallel for collapse(2)
+    for (int b = 0; b < B; b++) {
+        for (int t = idx; t < T; t++) {
+            float* out_bt_k = out + b * T * 3 * C + t * 3 * C + C;
+            float* out_bt_v = out + b * T * 3 * C + t * 3 * C + 2 * C;
+            float* cache_k = kv_cache + b * T * 2 * C + t * 2 * C;
+            float* cache_v = kv_cache + b * T * 2 * C + t * 2 * C + C;
+            for (int i = 0; i < C; i++) {
+                cache_k[i] = out_bt_k[i];
+                cache_v[i] = out_bt_v[i];
+            }
+        }
+    }
+}
+
+void fill_from_kv_cache(float* out, float* kv_cache, int B, int T, int C) {
+    //#pragma omp parallel for collapse(2)
+    for (int b = 0; b < B; b++) {
+        for (int t = 0; t < T; t++) {
+            float* out_bt_k = out + b * T * 3 * C + t * 3 * C + C;
+            float* out_bt_v = out + b * T * 3 * C + t * 3 * C + 2 * C;
+            float* cache_k = kv_cache + b * T * 2 * C + t * 2 * C;
+            float* cache_v = kv_cache + b * T * 2 * C + t * 2 * C + C;
+            for (int i = 0; i < C; i++) {
+                out_bt_k[i] = cache_k[i];
+                out_bt_v[i] = cache_v[i];
+            }
+        }
+    }
+}
+
 // Function to initialize array with random values
 void initialize_random(float *arr, int size) {
     for (int i = 0; i < size; i++) {
@@ -83,13 +115,17 @@ void initialize_random(float *arr, int size) {
 
 // Function to compare arrays
 int compare_arrays(float *arr1, float *arr2, int size) {
+    int equal = 1;
     for (int i = 0; i < size; i++) {
         if (fabs(arr1[i] - arr2[i]) > FLOAT_TOLERANCE) {
-            printf("%d\n", i);
-            return 0; // Arrays are not equal
+            printf("Noual: out1[%d] = %f, out2[%d] = %f\n", i, arr1[i], i, arr2[i]);
+            equal = 0;
+        }
+        else {
+            printf("Equal: out1[%d] = %f, out2[%d] = %f\n", i, arr1[i], i, arr2[i]);
         }
     }
-    return 1; // Arrays are equal
+    return equal;
 }
 
 int main() {
@@ -105,6 +141,8 @@ int main() {
     float *out1 = (float *)malloc(B * T * OC * sizeof(float));
     float *out2 = (float *)malloc(B * T * OC * sizeof(float));
 
+    float *kv_cache = (float *)malloc(B * T * 2 * C * sizeof(float));
+
     // Initialize inputs with random data
     initialize_random(inp, B * T * C);
     initialize_random(weight, OC * C);
@@ -115,9 +153,11 @@ int main() {
 
     // Perform matrix multiplication with matmul_forward
     matmul_forward(out1, inp, weight, bias, B, T, C, OC);
+    populate_kv_cache(kv_cache, out1, B, T, C, 0);
 
-    memcpy(out2, out1, B * T * OC * sizeof(float)); // Copy initial values from out1 to out2
+    //memcpy(out2, out1, B * T * OC * sizeof(float)); // Copy initial values from out1 to out2
     // Assume out2 already has valid data and only the last token K and V need to be updated
+    fill_from_kv_cache(out2, kv_cache, B, T, C);
     matmul_cached(out2, inp, weight, bias, B, T, C, OC);
 
     // Compare outputs
@@ -126,10 +166,10 @@ int main() {
     } else {
         printf("The outputs differ.\n");
 
-        printf("Inspecting outputs at critical indices:\n");
-        for (int idx = 64; idx < 64 + 10; idx++) {
-            printf("out1[%d] = %f, out2[%d] = %f\n", idx, out1[idx], idx, out2[idx]);
-        }
+        //printf("Inspecting outputs at critical indices:\n");
+        //for (int idx = 0; idx < 200; idx++) {
+        //    printf("out1[%d] = %f, out2[%d] = %f\n", idx, out1[idx], idx, out2[idx]);
+        //}
     }
 
     // Clean up
