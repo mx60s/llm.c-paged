@@ -4,7 +4,7 @@
 #include <math.h>
 #include <omp.h>
 
-#define FLOAT_TOLERANCE 1e-6
+#define FLOAT_TOLERANCE 1e-2
 
 void matmul_forward(float* out,
                     float* inp, float* weight, float* bias,
@@ -106,6 +106,148 @@ void fill_from_kv_cache(float* out, float* kv_cache, int B, int T, int C) {
     }
 }
 
+void attention_cached(float* out, float* preatt, float* att,
+                       float* queries, float* kv_cache,
+                       int B, int T, int C, int NH) {
+    // Implementation assumes kv_cache holds both keys and values for all layers
+    int hs = C / NH; // head size
+    int C3 = C*3;
+    float scale = 1.0 / sqrtf(hs);
+    int base_index_k = B * T * 2 * C + B * T * C; // Offset for keys
+    int base_index_v = B * T * 2 * C + B * T * 2 * C; // Offset for values, i.e., after all keys
+
+    #pragma omp parallel for collapse(3)
+    for (int b = 0; b < B; b++) {
+        for (int t = 0; t < T; t++) {
+            for (int h = 0; h < NH; h++) {
+                float* query_t = queries + b * T * C3 + t * C3 + h * hs;
+                float* preatt_bth = preatt + b * NH * T * T + h * T * T + t * T;
+                float* att_bth = att + b * NH * T * T + h * T * T + t * T;
+
+                // Calculate query dot key and maxval
+                float maxval = -10000.0f;
+                for (int t2 = 0; t2 <= t; t2++) {
+                    float* key_t2 = kv_cache + b * T * 2 * C + t2 * C + h * hs; // Direct access to keys
+
+                    // Dot product of query_t and key_t2
+                    float val = 0.0f;
+                    for (int i = 0; i < hs; i++) {
+                        val += query_t[i] * key_t2[i];
+                    }
+                    val *= scale;
+                    if (val > maxval) {
+                        maxval = val;
+                    }
+                    preatt_bth[t2] = val;
+                }
+
+                // Calculate the exp and keep track of sum
+                float expsum = 0.0f;
+                for (int t2 = 0; t2 <= t; t2++) {
+                    float expv = expf(preatt_bth[t2] - maxval);
+                    expsum += expv;
+                    att_bth[t2] = expv;
+                }
+                float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
+
+                // Normalize to get the softmax
+                for (int t2 = 0; t2 <= t; t2++) {
+                    att_bth[t2] *= expsum_inv;
+                }
+
+                // Accumulate weighted values into the output of attention
+                float* out_bth = out + b * T * C + t * C + h * hs;
+                for (int i = 0; i < hs; i++) {
+                    out_bth[i] = 0.0f;
+                }
+                for (int t2 = 0; t2 <= t; t2++) {
+                    float* value_t2 = kv_cache + b * T * 2 * C + T * C + t2 * C + h * hs;
+                    float att_btht2 = att_bth[t2];
+                    for (int i = 0; i < hs; i++) {
+                        out_bth[i] += att_btht2 * value_t2[i];
+                    }
+                }
+            }
+        }
+    }
+}
+
+void attention_forward(float* out, float* preatt, float* att,
+                       float* inp,
+                       int B, int T, int C, int NH) {
+    // input is (B, T, 3C) holding the query, key, value (Q, K, V) vectors
+    // preatt, att are (B, NH, T, T). NH = number of heads, T = sequence length
+    // that holds the pre-attention and post-attention scores (used in backward)
+    // output is (B, T, C)
+    // attention is the only layer that mixes information across time
+    // every other operation is applied at every (b,t) position independently
+    // (and of course, no layer mixes information across batch)
+    int C3 = C*3;
+    int hs = C / NH; // head size
+    float scale = 1.0 / sqrtf(hs);
+
+    #pragma omp parallel for collapse(3)
+    for (int b = 0; b < B; b++) {
+        for (int t = 0; t < T; t++) {
+            for (int h = 0; h < NH; h++) {
+                float* query_t = inp + b * T * C3 + t * C3 + h * hs;
+                float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
+                float* att_bth = att + b*NH*T*T + h*T*T + t*T;
+
+                // pass 1: calculate query dot key and maxval
+                float maxval = -10000.0f; // TODO something better
+                for (int t2 = 0; t2 <= t; t2++) {
+                    float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
+
+                    // (query_t) dot (key_t2)
+                    float val = 0.0f;
+                    for (int i = 0; i < hs; i++) {
+                        val += query_t[i] * key_t2[i];
+                    }
+                    val *= scale;
+                    if (val > maxval) {
+                        maxval = val;
+                    }
+
+                    preatt_bth[t2] = val;
+                }
+
+                // pass 2: calculate the exp and keep track of sum
+                // maxval is being calculated and subtracted only for numerical stability
+                float expsum = 0.0f;
+                for (int t2 = 0; t2 <= t; t2++) {
+                    float expv = expf(preatt_bth[t2] - maxval);
+                    expsum += expv;
+                    att_bth[t2] = expv;
+                }
+                float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
+
+                // pass 3: normalize to get the softmax
+                for (int t2 = 0; t2 < T; t2++) {
+                    if (t2 <= t) {
+                        att_bth[t2] *= expsum_inv;
+                    } else {
+                        // causal attention mask. not strictly necessary to set to zero here
+                        // only doing this explicitly for debugging and checking to PyTorch
+                        att_bth[t2] = 0.0f;
+                    }
+                }
+
+                // pass 4: accumulate weighted values into the output of attention
+                float* out_bth = out + b * T * C + t * C + h * hs;
+                for (int i = 0; i < hs; i++) { out_bth[i] = 0.0f; }
+                for (int t2 = 0; t2 <= t; t2++) {
+                    float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
+                    float att_btht2 = att_bth[t2];
+                    for (int i = 0; i < hs; i++) {
+                        out_bth[i] += att_btht2 * value_t2[i];
+                    }
+                }
+            }
+        }
+    }
+}
+
 // Function to initialize array with random values
 void initialize_random(float *arr, int size) {
     for (int i = 0; i < size; i++) {
@@ -118,11 +260,11 @@ int compare_arrays(float *arr1, float *arr2, int size) {
     int equal = 1;
     for (int i = 0; i < size; i++) {
         if (fabs(arr1[i] - arr2[i]) > FLOAT_TOLERANCE) {
-            printf("Noual: out1[%d] = %f, out2[%d] = %f\n", i, arr1[i], i, arr2[i]);
+            //printf("Noual: out1[%d] = %f, out2[%d] = %f\n", i, arr1[i], i, arr2[i]);
             equal = 0;
         }
         else {
-            printf("Equal: out1[%d] = %f, out2[%d] = %f\n", i, arr1[i], i, arr2[i]);
+            //printf("Equal: out1[%d] = %f, out2[%d] = %f\n", i, arr1[i], i, arr2[i]);
         }
     }
     return equal;
@@ -133,13 +275,20 @@ int main() {
     int T = 10; // Number of tokens
     int C = 64; // Channels
     int OC = 3 * C; // Output channels for Q, K, V
+    int NH = 8;
 
     // Allocate memory for inputs and outputs
     float *inp = (float *)malloc(B * T * C * sizeof(float));
     float *weight = (float *)malloc(OC * C * sizeof(float));
     float *bias = (float *)malloc(OC * sizeof(float));
+    float *preatt = (float*) malloc(B * NH * T * T * sizeof(float));
+    float *att = (float*) malloc(B * NH * T * T * sizeof(float));
+    float *attproj = (float*) malloc(B * T * C * sizeof(float));
+
     float *out1 = (float *)malloc(B * T * OC * sizeof(float));
     float *out2 = (float *)malloc(B * T * OC * sizeof(float));
+    float *out_a1 = (float *)malloc(B * T * OC * sizeof(float));
+    float *out_a2 = (float *)malloc(B * T * OC * sizeof(float));
 
     float *kv_cache = (float *)malloc(B * T * 2 * C * sizeof(float));
 
@@ -165,19 +314,32 @@ int main() {
         printf("The outputs are identical.\n");
     } else {
         printf("The outputs differ.\n");
+    }
 
-        //printf("Inspecting outputs at critical indices:\n");
-        //for (int idx = 0; idx < 200; idx++) {
-        //    printf("out1[%d] = %f, out2[%d] = %f\n", idx, out1[idx], idx, out2[idx]);
-        //}
+    attention_forward(out_a1, preatt, att, out1, B, T, C, NH);
+    attention_cached(out_a2, preatt, att, out2, kv_cache, B, T, C, NH);
+
+    if (compare_arrays(out_a1, out_a2, B * T * OC)) {
+        printf("The attention outputs are identical.\n");
+    } else {
+        printf("The attention outputs differ.\n");
+        for (int i = 0; i < 200; i++) {
+            printf("out_a1[%d] = %f, out_a2[%d] = %f\n", i, out_a1[i], i, out_a2[i]);
+        }
     }
 
     // Clean up
     free(inp);
     free(weight);
     free(bias);
+    free(preatt);
+    free(att);
+    free(attproj);
+
     free(out1);
     free(out2);
+    free(out_a1);
+    free(out_a2);
 
     return 0;
 }

@@ -931,7 +931,7 @@ int main(int arc, char **argv) {
     // some memory for generating samples from the model
     unsigned long long rng_state = 1337;
     int* gen_tokens = (int*)malloc(B * T * sizeof(int));
-    const int totalSize = 80; // number of steps of inference we will do
+    const int totalSize = 300; // number of steps of inference we will do
     // genT can be larger than T if we slide the window
 
 
@@ -942,7 +942,7 @@ int main(int arc, char **argv) {
     
     // not stoachstic 
 
-    int PROMPT_SIZE = 14;
+    int PROMPT_SIZE = 30;
 
     printf("T (sequence length): %d\n", T);
     printf("PROMPT_SIZE: %d\n", PROMPT_SIZE);
@@ -1010,7 +1010,7 @@ int main(int arc, char **argv) {
     // now continue with a sliding window past the context length
     for (int t = T; t < totalSize; t++) {
         //gpt2_forward(&model, gen_tokens + (t - T), NULL, B, T, totalSize, t - T);
-        gpt2_forward(&model, gen_tokens + (t - T), NULL, B, T, totalSize, 1); // 1 indicates that we should increment kv cache
+        gpt2_forward(&model, gen_tokens + (t - T), NULL, B, T, totalSize, t - T);
         // printf("finished forward\n");
         // either T-1 or T not sure
         float* probs = model.acts.probs + (T-1) * model.config.vocab_size;
