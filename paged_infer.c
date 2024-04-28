@@ -984,7 +984,6 @@ void free_kv_block(KVBlock* block) {
 }
 
 
-
 int main(int arc, char **argv) {
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
