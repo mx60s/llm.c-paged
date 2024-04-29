@@ -11,19 +11,18 @@ INCLUDES =
 # e.g. on Ubuntu: sudo apt-get install libomp-dev
 # later, run the program by prepending the number of threads, e.g.: OMP_NUM_THREADS=8 ./gpt2
 ifeq ($(shell uname), Darwin)
-  # Check if the libomp directory exists
-  ifeq ($(shell [ -d /opt/homebrew/opt/libomp/lib ] && echo "exists"), exists)
-    # macOS with Homebrew and directory exists
-    CFLAGS += -Xclang -fopenmp -DOMP
-    LDFLAGS += -L/opt/homebrew/opt/libomp/lib
+  ARCH := $(shell uname -m)
+  ifeq ($(ARCH), x86_64)
+    LIBOMP_PATH = /usr/local/opt/libomp
+  else ifeq ($(ARCH), arm64)
+    LIBOMP_PATH = /opt/homebrew/opt/libomp
+  endif
+
+  ifeq ($(shell [ -d $(LIBOMP_PATH)/lib ] && echo "exists"), exists)
+    CFLAGS += -Xclang -fopenmp -DOMP -target $(ARCH)-apple-macos10.15
+    LDFLAGS += -L$(LIBOMP_PATH)/lib
     LDLIBS += -lomp
-    INCLUDES += -I/opt/homebrew/opt/libomp/include
-    $(info NICE Compiling with OpenMP support)
-  else ifeq ($(shell [ -d /usr/local/opt/libomp/lib ] && echo "exists"), exists)
-    CFLAGS += -Xclang -fopenmp -DOMP
-    LDFLAGS += -L/usr/local/opt/libomp/lib
-    LDLIBS += -lomp
-    INCLUDES += -I/usr/local/opt/libomp/include
+    INCLUDES += -I$(LIBOMP_PATH)/include
     $(info NICE Compiling with OpenMP support)
   else
     $(warning OOPS Compiling without OpenMP support)
@@ -40,7 +39,7 @@ else
 endif
 
 # PHONY means these targets will always be executed
-.PHONY: all train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu infer test_infer cached_infer
+.PHONY: all clean train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu infer test_infer cached_infer
 
 # default target is all
 all: train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu infer test_infer cached_infer
@@ -48,13 +47,7 @@ all: train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu infer test_infer cached_infer
 train_gpt2: train_gpt2.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -o $@
 
-train_scratch: train_scratch.c
-	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -o $@
-
 test_gpt2: test_gpt2.c
-	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -o $@
-
-test_infer: test_infer.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -o $@
 
 infer: infer.c
@@ -63,10 +56,9 @@ infer: infer.c
 cached_infer: cached_infer.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -o $@
 
-test_kv_cache: test_kv_cache.c
+test_infer: test_infer.c
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) $< $(LDLIBS) -o $@
 
-# possibly may want to disable warnings? e.g. append -Xcompiler -Wno-unused-result
 train_gpt2cu: train_gpt2.cu
 	nvcc -O3 --use_fast_math $< -lcublas -lcublasLt -o $@
 
@@ -75,4 +67,3 @@ test_gpt2cu: test_gpt2.cu
 
 clean:
 	rm -f train_gpt2 test_gpt2 train_gpt2cu test_gpt2cu infer test_infer cached_infer
-

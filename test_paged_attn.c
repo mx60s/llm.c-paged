@@ -81,62 +81,62 @@ void attention_forward(float* out, float* preatt, float* att,
 }
 
 void attention_paged(float* out, float* preatt, float* att,
-                       float* inp,
-                       float** key_blocks, float** value_blocks,
-                       int B, int T, int C, int NH, int num_blocks) {
-    // Input is (B, T, C) holding the query vectors
-    // key_blocks and value_blocks are arrays of pointers to the key and value blocks
-    // preatt, att are (B, NH, T, T). NH = number of heads, T = sequence length
-    // Output is (B, T, C)
-    int C3 = C*3;
+                             float* inp, float** key_blocks, float** value_blocks,
+                             int B, int T, int C, int NH, int num_blocks) {
+
     int hs = C / NH; // head size per attention head
     float scale = 1.0 / sqrtf(hs);
-    int block_size = T / num_blocks;
+    int block_size = T / num_blocks; 
 
     #pragma omp parallel for collapse(3)
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
-            int block_index_t = t / block_size; // block index for the query token
-
             for (int h = 0; h < NH; h++) {
-                float* query_t = inp + b * T * C3 + t * C3 + h * hs;
-                float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
-                float* att_bth = att + b*NH*T*T + h*T*T + t*T;
-
+                float* query_t = inp + b * T * C + t * C + h * hs;
                 float* out_bth = out + b * T * C + t * C + h * hs;
-                for (int i = 0; i < hs; i++) { out_bth[i] = 0.0f; }
+                int num_blocks_to_consider = (t / block_size) + 1;
 
-                for (int block_index = 0; block_index <= block_index_t; block_index++) {
-                    float* key_block = key_blocks[block_index];
-                    float* value_block = value_blocks[block_index];
+                for (int i = 0; i < hs; i++) out_bth[i] = 0.0f;
 
-                    float maxval = -10000.0f;
-                    float expsum = 0.0f;
-
+                float maxval = -10000.0f;
+                for (int j = 0; j < num_blocks_to_consider; j++) {
+                    float* key_block = key_blocks[j];
+                    float* preatt_bth = preatt + b * NH * T * T + h * T * T + t * T + j * block_size;
                     for (int t2 = 0; t2 < block_size; t2++) {
-                        float* key_t2 = key_block + t2 * hs;
                         float val = 0.0f;
                         for (int i = 0; i < hs; i++) {
-                            val += query_t[i] * key_t2[i];
+                            val += query_t[i] * key_block[t2 * hs + i];
                         }
                         val *= scale;
-                        preatt_bth[t2 + block_index * block_size] = val;
+                        preatt_bth[t2] = val;
                         if (val > maxval) maxval = val;
                     }
+                }
 
+                float expsum = 0.0f;
+                for (int j = 0; j < num_blocks_to_consider; j++) {
+                    float* att_bth = att + b * NH * T * T + h * T * T + t * T + j * block_size;
+                    float* preatt_bth = preatt + b * NH * T * T + h * T * T + t * T + j * block_size;
                     for (int t2 = 0; t2 < block_size; t2++) {
-                        float expv = expf(preatt_bth[t2 + block_index * block_size] - maxval);
+                        float expv = expf(preatt_bth[t2] - maxval);
                         expsum += expv;
-                        att_bth[t2 + block_index * block_size] = expv;
+                        att_bth[t2] = expv;
                     }
+                }
 
-                    float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
-
+                for (int j = 0; j < num_blocks_to_consider; j++) {
+                    float* att_bth = att + b * NH * T * T + h * T * T + t * T + j * block_size;
                     for (int t2 = 0; t2 < block_size; t2++) {
-                        att_bth[t2 + block_index * block_size] *= expsum_inv;
-                        float* value_t2 = value_block + t2 * hs;
+                        att_bth[t2] /= expsum;
+                    }
+                }
+
+                for (int j = 0; j < num_blocks_to_consider; j++) {
+                    float* value_block = value_blocks[j];
+                    float* att_bth = att + b * NH * T * T + h * T * T + t * T + j * block_size;
+                    for (int t2 = 0; t2 < block_size; t2++) {
                         for (int i = 0; i < hs; i++) {
-                            out_bth[i] += att_bth[t2 + block_index * block_size] * value_t2[i];
+                            out_bth[i] += att_bth[t2] * value_block[t2 * hs + i];
                         }
                     }
                 }
@@ -170,10 +170,10 @@ void print_array(float* array, int size) {
 
 int main() {
     int B = 1;  
-    int T = 5; 
-    int C = 1; 
-    int NH = 1; 
-    int num_blocks = 5;
+    int T = 19; 
+    int C = 10; 
+    int NH = 8; 
+    int num_blocks = 10;
 
     float* inp = (float*)malloc(B * T * 3 * C * sizeof(float));
     float* out_standard = (float*)malloc(B * T * C * sizeof(float));
@@ -199,8 +199,12 @@ int main() {
         }
     }
 
-    attention_forward(out_standard, preatt, att, inp, B, T, C, NH);
+    key_blocks[num_blocks-1][block_size * C - 1] = 0;
+    value_blocks[num_blocks-1][block_size * C - 1] = 0;
 
+    printf("before attn\n");
+    attention_forward(out_standard, preatt, att, inp, B, T, C, NH);
+    printf("before paged attn\n");
     attention_paged(out_block, preatt, att, inp, key_blocks, value_blocks, B, T, C, NH, num_blocks);
 
     if (compare_arrays(out_standard, out_block, B * T * C)) {
