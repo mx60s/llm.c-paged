@@ -12,6 +12,11 @@
 #include <omp.h>
 #endif
 
+
+#define MAX_PROMPTS 100 // should end up being equal to batch size I guess
+#define MAX_BLOCKS  100
+#define BLOCK_SIZE  32 
+
 // ----------------------------------------------------------------------------
 // all the individual layers' forward and backward passes
 // B = batch_size, T = sequence_length, C = channels, V = vocab_size
@@ -167,7 +172,7 @@ void attention_paged(float* out, float* preatt, float* att,
     int C3 = C*3;
     int hs = C / NH; // head size per attention head
     float scale = 1.0 / sqrtf(hs);
-    int block_size = 32; 
+    // int block_size = 32; 
 
     #pragma omp parallel for collapse(3)
     for (int b = 0; b < B; b++) {
@@ -182,7 +187,7 @@ void attention_paged(float* out, float* preatt, float* att,
                 float maxval = -10000.0f; // TODO something better
                 for (int t2 = 0; t2 <= t; t2++) { // t2 is the index of the token in the global sequence
                     // float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
-                    float* key_t2 = key_blocks[(t2+offset) / block_size] + ((t2+offset) % block_size) * C + h * hs;
+                    float* key_t2 = key_blocks[(t2+offset) / BLOCK_SIZE] + ((t2+offset) % BLOCK_SIZE) * C + h * hs;
 
                     // (query_t) dot (key_t2)
                     float val = 0.0f;
@@ -223,7 +228,7 @@ void attention_paged(float* out, float* preatt, float* att,
                 for (int i = 0; i < hs; i++) { out_bth[i] = 0.0f; }
                 for (int t2 = 0; t2 <= t; t2++) {
                     // float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
-                    float* value_t2 = value_blocks[(t2+offset) / block_size] + ((t2+offset) % block_size) * C + h * hs;
+                    float* value_t2 = value_blocks[(t2+offset) / BLOCK_SIZE] + ((t2+offset) % BLOCK_SIZE) * C + h * hs;
                     float att_btht2 = att_bth[t2];
                     for (int i = 0; i < hs; i++) {
                         out_bth[i] += att_btht2 * value_t2[i];
@@ -497,13 +502,22 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 }
 
 // ok the only real reason this is wrapped up is because later when we have a B > 1 it's cleaner
-void add_to_cache(BlockManager* manager, float* qkv, int B, int T, int C, int idx) {
+void add_to_cache(BlockManager* manager, float* qkv, int B, int T, int C, int how_many_tokens_to_copy_from_the_end_of_sequence) {
+    // this function takes in the outputs from our matmul_forward or matmul_cached pass
+    // because the output can come from either pass, our input can be of variable size
+    // idx keeps track of where we should start grabbing keys and values for each token
+    // manager is our block manager
+    // B and T and C are just used for indexing
+    // after this function, we're going to be doing a separate function before attention, where
+    // we grab the keys and values within the context window and pass it to attention.
+    
+
     int b = 0; // placeholder
 
     KVBlock* curr_block;
     if ((curr_block = get_current_block(manager, b))) {
         printf("Got current block\n");
-        if (curr_block->filled == 32) { // need to think more carefully about this
+        if (curr_block->filled >= BLOCK_SIZE) { // need to think more carefully about this
             printf("Current block full, getting new one.\n");
             curr_block = request_block(manager, b); // TODO handle null case
         } else {
@@ -514,29 +528,31 @@ void add_to_cache(BlockManager* manager, float* qkv, int B, int T, int C, int id
         curr_block = request_block(manager, b); // TODO handle null case
     }
 
-    printf("State before adding new %d vals to cache in current block\n", T-idx);
+    printf("how_many_tokens_to_copy_from_the_end_of_sequence: %d \n", how_many_tokens_to_copy_from_the_end_of_sequence);
     print_state(manager, b);
 
     float* block_keys = curr_block->keys;
     float* block_values = curr_block->values;
 
-    int offset = curr_block->filled * C;
+    int last_block_offset_inside_it = curr_block->filled * C;
 
     printf("Block keys address: %p, Block values address: %p\n", block_keys, block_values);
-    printf("Offset: %d, Filled: %d\n", offset, curr_block->filled);
+    printf("Offset: %d, Filled: %d\n", last_block_offset_inside_it, curr_block->filled);
 
     // need to add logic where if we can't fill up the whole block we loop and fill blocks until we're done
     // that being said will we ever need to do that if our block size
-    // and our T are the same or T < block_size?
+    // and our T are the same or T < BLOCK_SIZE?
     // let's just work under that assumption for now
 
     //#pragma omp parallel for collapse(2)
     for (int b = 0; b < B; b++) { // we're totally assuming b is 1 right now lol
-        for (int t = idx; t < T; t++) {
+        int position_in_cache = 0;
+        for (int t = T-how_many_tokens_to_copy_from_the_end_of_sequence; t < T; t++) {
             float* out_bt_k = qkv + b * T * 3 * C + t * 3 * C + C;
             float* out_bt_v = qkv + b * T * 3 * C + t * 3 * C + 2 * C;
-            float* cache_k = block_keys + offset + t * C;
-            float* cache_v = block_values + offset + t * C;
+            float* cache_k = block_keys + last_block_offset_inside_it + position_in_cache * C;
+            float* cache_v = block_values + last_block_offset_inside_it + position_in_cache * C;
+            printf("t = %d\n", t);
             for (int i = 0; i < C; i++) {
                 //printf("is this access the issue? %f\n", cache_k[i]);
                 //printf("or this access the issue? %f\n", cache_v[i]);
@@ -545,18 +561,18 @@ void add_to_cache(BlockManager* manager, float* qkv, int B, int T, int C, int id
                 cache_k[i] = out_bt_k[i];
                 cache_v[i] = out_bt_v[i];
             }
+            position_in_cache++;
         }
     }
 
-    printf("segfault here?\n");
+    // printf("segfault here?\n");
 
-    printf("State after adding %d new vals to cache:\n", T-idx);
-    curr_block->filled += T - idx;
+    curr_block->filled += how_many_tokens_to_copy_from_the_end_of_sequence;
+    printf("AFTER: Offset: %d, Filled: %d\n", last_block_offset_inside_it, curr_block->filled);
     print_state(manager, b);
 }
 
-// might not need curr_iter anymore tbh I'm not sure
-void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, size_t max_total, int curr_iter) {
+void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, size_t max_total, int offset) {
     // targets are optional and could be NULL
 
     // ensure the model was initialized or error out
@@ -679,24 +695,24 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, si
         // now do the forward pass
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
 
-        int kv_start;
+        int how_many_tokens_to_copy_from_the_end_of_sequence;
         if (first_pass) { // need to update first pass logic because won't work with multiple rounds of prompts 
         // and actually I think this is probably why we need to have the first pass be like, a full first pass so we can set it appropriately
         // maybe you could just set the flag per new prompt I guess
             // only called the first time, to populate the cache
             matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
-            kv_start = 0;
+            how_many_tokens_to_copy_from_the_end_of_sequence = T;
         } else {
             matmul_cached(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
-            kv_start = T-1;
+            how_many_tokens_to_copy_from_the_end_of_sequence = 1;
         }
 
-        add_to_cache(model->manager, l_qkv, B, T, C, kv_start);
+        add_to_cache(model->manager, l_qkv, B, T, C, how_many_tokens_to_copy_from_the_end_of_sequence);
 
         int num_blocks; // I'm leaving this alone but don't think I need it for now
         float*** kv_blocks = collect_kv_blocks(model->manager, 0, &num_blocks);
 
-        attention_paged(l_atty, l_preatt, l_att, l_qkv, kv_blocks[0], kv_blocks[1], B, T, C, NH, curr_iter);
+        attention_paged(l_atty, l_preatt, l_att, l_qkv, kv_blocks[0], kv_blocks[1], B, T, C, NH, offset);
         matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
         residual_forward(l_residual2, residual, l_attproj, B*T*C);
         layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
@@ -957,8 +973,8 @@ int main(int arc, char **argv) {
 
     // some memory for generating samples from the model
     unsigned long long rng_state = 1337;
-    int* gen_tokens = (int*)malloc(B * T * sizeof(int));
-    const int totalSize = 35;//300; // number of steps of inference we will do
+    const int totalSize = 50;//300; // number of steps of inference we will do
+    int* gen_tokens = (int*)malloc(B * totalSize * sizeof(int));
     // genT can be larger than T if we slide the window
 
     int C = model.config.channels;
@@ -1069,7 +1085,11 @@ int main(int arc, char **argv) {
     clock_gettime(CLOCK_MONOTONIC, &end);
     double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
     printf("Generating with paged caching took (took %f ms)\n", time_elapsed_s * 1000);
-    
+
+    for (int i = 0; i < totalSize; i++) {
+        const char* token_str = tokenizer_decode(&tokenizer, gen_tokens[i]);
+        safe_printf(token_str);
+    }    
 
     // free
     // dataloader_free(&train_loader);
