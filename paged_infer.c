@@ -154,64 +154,35 @@ void matmul_cached(float* out,
     }
 }
 
-void populate_kv_cache(float* kv_cache, float* out, int B, int T, int C, int idx) {
-    #pragma omp parallel for collapse(2)
-    for (int b = 0; b < B; b++) {
-        for (int t = idx; t < T; t++) {
-            float* out_bt_k = out + b * T * 3 * C + t * 3 * C + C;
-            float* out_bt_v = out + b * T * 3 * C + t * 3 * C + 2 * C;
-            float* cache_k = kv_cache + b * T * 2 * C + t * 2 * C;
-            float* cache_v = kv_cache + b * T * 2 * C + t * 2 * C + C;
-            for (int i = 0; i < C; i++) {
-                cache_k[i] = out_bt_k[i];
-                cache_v[i] = out_bt_v[i];
-            }
-        }
-    }
-}
 
-void fill_from_kv_cache(float* out, float* kv_cache, int B, int T, int C) {
-    #pragma omp parallel for collapse(2)
-    for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
-            float* out_bt_k = out + b * T * 3 * C + t * 3 * C + C;
-            float* out_bt_v = out + b * T * 3 * C + t * 3 * C + 2 * C;
-            float* cache_k = kv_cache + b * T * 2 * C + t * 2 * C;
-            float* cache_v = kv_cache + b * T * 2 * C + t * 2 * C + C;
-            for (int i = 0; i < C; i++) {
-                out_bt_k[i] = cache_k[i];
-                out_bt_v[i] = cache_v[i];
-            }
-        }
-    }
-}
+void attention_paged(float* out, float* preatt, float* att,
+                             float* inp, float** key_blocks, float** value_blocks,
+                             int B, int T, int C, int NH, int offset) {
 
-void attention_forward(float* out, float* preatt, float* att,
-                       float* inp,
-                       int B, int T, int C, int NH) {
-    // input is (B, T, 3C) holding the query, key, value (Q, K, V) vectors
-    // preatt, att are (B, NH, T, T). NH = number of heads, T = sequence length
-    // that holds the pre-attention and post-attention scores (used in backward)
-    // output is (B, T, C)
-    // attention is the only layer that mixes information across time
-    // every other operation is applied at every (b,t) position independently
-    // (and of course, no layer mixes information across batch)
+    // NOTE: for now it is important to keep in mind that this function was written with the assumption
+    // that starting in the key_blocks and value_blocks references (starting from the offset), 
+    // the sequence is contiguous meaning that the blocks are ordered properly.
+    // they blocks lists are basicallly the global sequence and the offset tells us where to run on.
+    // the float* inp is everything else other than the key and value blocks.
     int C3 = C*3;
-    int hs = C / NH; // head size
+    int hs = C / NH; // head size per attention head
     float scale = 1.0 / sqrtf(hs);
+    int block_size = 32; 
 
     #pragma omp parallel for collapse(3)
     for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
+        for (int t = 0; t < T; t++) { // t is the index of the token within the sequence from the point of view of the attention
             for (int h = 0; h < NH; h++) {
+
                 float* query_t = inp + b * T * C3 + t * C3 + h * hs;
                 float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
                 float* att_bth = att + b*NH*T*T + h*T*T + t*T;
 
                 // pass 1: calculate query dot key and maxval
                 float maxval = -10000.0f; // TODO something better
-                for (int t2 = 0; t2 <= t; t2++) {
-                    float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
+                for (int t2 = 0; t2 <= t; t2++) { // t2 is the index of the token in the global sequence
+                    // float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
+                    float* key_t2 = key_blocks[(t2+offset) / block_size] + ((t2+offset) % block_size) * C + h * hs;
 
                     // (query_t) dot (key_t2)
                     float val = 0.0f;
@@ -251,7 +222,8 @@ void attention_forward(float* out, float* preatt, float* att,
                 float* out_bth = out + b * T * C + t * C + h * hs;
                 for (int i = 0; i < hs; i++) { out_bth[i] = 0.0f; }
                 for (int t2 = 0; t2 <= t; t2++) {
-                    float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
+                    // float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
+                    float* value_t2 = value_blocks[(t2+offset) / block_size] + ((t2+offset) % block_size) * C + h * hs;
                     float att_btht2 = att_bth[t2];
                     for (int i = 0; i < hs; i++) {
                         out_bth[i] += att_btht2 * value_t2[i];
@@ -262,71 +234,6 @@ void attention_forward(float* out, float* preatt, float* att,
     }
 }
 
-void attention_paged(float* out, float* preatt, float* att,
-                             float* inp, float** key_blocks, float** value_blocks,
-                             int B, int T, int C, int NH, int num_blocks) {
-
-    int C3 = C*3;
-    int hs = C / NH; // head size per attention head
-    float scale = 1.0 / sqrtf(hs);
-    int block_size = T / num_blocks; 
-
-    #pragma omp parallel for collapse(3)
-    for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
-            for (int h = 0; h < NH; h++) {
-                float* query_t = inp + b * T * C3 + t * C3 + h * hs;
-                float* out_bth = out + b * T * C + t * C + h * hs;
-                int num_blocks_to_consider = (t / block_size) + 1;
-
-                for (int i = 0; i < hs; i++) out_bth[i] = 0.0f;
-
-                float maxval = -10000.0f;
-                for (int j = 0; j < num_blocks_to_consider; j++) {
-                    float* key_block = key_blocks[j];
-                    float* preatt_bth = preatt + b * NH * T * T + h * T * T + t * T + j * block_size;
-                    for (int t2 = 0; t2 < block_size; t2++) {
-                        float val = 0.0f;
-                        for (int i = 0; i < hs; i++) {
-                            val += query_t[i] * key_block[t2 * hs + i];
-                        }
-                        val *= scale;
-                        preatt_bth[t2] = val;
-                        if (val > maxval) maxval = val;
-                    }
-                }
-
-                float expsum = 0.0f;
-                for (int j = 0; j < num_blocks_to_consider; j++) {
-                    float* att_bth = att + b * NH * T * T + h * T * T + t * T + j * block_size;
-                    float* preatt_bth = preatt + b * NH * T * T + h * T * T + t * T + j * block_size;
-                    for (int t2 = 0; t2 < block_size; t2++) {
-                        float expv = expf(preatt_bth[t2] - maxval);
-                        expsum += expv;
-                        att_bth[t2] = expv;
-                    }
-                }
-
-                for (int j = 0; j < num_blocks_to_consider; j++) {
-                    float* att_bth = att + b * NH * T * T + h * T * T + t * T + j * block_size;
-                    for (int t2 = 0; t2 < block_size; t2++) {
-                        att_bth[t2] /= expsum;
-                    }
-                }
-
-                for (int j = 0; j < num_blocks_to_consider; j++) {
-                    float* value_block = value_blocks[j];
-                    float* att_bth = att + b * NH * T * T + h * T * T + t * T + j * block_size;
-                    for (int t2 = 0; t2 < block_size; t2++) {
-                        for (int i = 0; i < hs; i++) {
-                            out_bth[i] += att_bth[t2] * value_block[t2 * hs + i];
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
 
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
 void gelu_forward(float* out, float* inp, int N) {
@@ -517,8 +424,7 @@ typedef struct {
     int* inputs; // the input tokens for the current forward pass
     int* targets; // the target tokens for the current forward pass
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
-    //float* kv_cache;
-    //float* kv_cache_curr;
+    // kv cache stuff
     BlockManager* manager;
 } GPT2;
 
@@ -594,28 +500,37 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 void add_to_cache(BlockManager* manager, float* qkv, int B, int T, int C, int idx) {
     int b = 0; // placeholder
 
-    kv_block* curr_block;
-    if (curr_block = get_current_block(manager, b)) {
+    KVBlock* curr_block;
+    if ((curr_block = get_current_block(manager, b))) {
+        printf("Got current block\n");
         if (curr_block->filled == 32) { // need to think more carefully about this
+            printf("Current block full, getting new one.\n");
             curr_block = request_block(manager, b); // TODO handle null case
         } else {
             curr_block->lru_counter = ++manager->lru_epoch;
         }
     } else {
+        printf("No blocks, requesting one\n");
         curr_block = request_block(manager, b); // TODO handle null case
     }
+
+    printf("State before adding new %d vals to cache in current block\n", T-idx);
+    print_state(manager, b);
 
     float* block_keys = curr_block->keys;
     float* block_values = curr_block->values;
 
     int offset = curr_block->filled * C;
 
+    printf("Block keys address: %p, Block values address: %p\n", block_keys, block_values);
+    printf("Offset: %d, Filled: %d\n", offset, curr_block->filled);
+
     // need to add logic where if we can't fill up the whole block we loop and fill blocks until we're done
     // that being said will we ever need to do that if our block size
     // and our T are the same or T < block_size?
     // let's just work under that assumption for now
 
-    #pragma omp parallel for collapse(2)
+    //#pragma omp parallel for collapse(2)
     for (int b = 0; b < B; b++) { // we're totally assuming b is 1 right now lol
         for (int t = idx; t < T; t++) {
             float* out_bt_k = qkv + b * T * 3 * C + t * 3 * C + C;
@@ -623,13 +538,21 @@ void add_to_cache(BlockManager* manager, float* qkv, int B, int T, int C, int id
             float* cache_k = block_keys + offset + t * C;
             float* cache_v = block_values + offset + t * C;
             for (int i = 0; i < C; i++) {
+                //printf("is this access the issue? %f\n", cache_k[i]);
+                //printf("or this access the issue? %f\n", cache_v[i]);
+                //printf("or this? %f\n", out_bt_k[i]);
+                //printf("or this?? %f\n", out_bt_v[i]);
                 cache_k[i] = out_bt_k[i];
                 cache_v[i] = out_bt_v[i];
             }
         }
     }
 
+    printf("segfault here?\n");
+
+    printf("State after adding %d new vals to cache:\n", T-idx);
     curr_block->filled += T - idx;
+    print_state(manager, b);
 }
 
 // might not need curr_iter anymore tbh I'm not sure
@@ -656,17 +579,9 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, si
         }
     }
 
-    int use_kv_cache = 1;
-
+    int first_pass = 0;
     if(model->acts_memory == NULL) {
-        //printf("initializing model\n");
-        use_kv_cache = 0;
-            
-        //model->kv_cache = (float*)malloc(L*B*2*C*max_total * sizeof(float*));
-        //model->kv_cache = (float*)malloc(L*B*2*C*T * sizeof(float*));
-        //model->kv_cache_curr = model->kv_cache;
-        use_kv_cache = 0; // should populate with full values
-
+        first_pass = 1; // TODO don't forget that we'll need to change this for more than one prompt
         // record the current B,T as well
         model->batch_size = B;
         model->seq_len = T;
@@ -712,9 +627,6 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, si
             exit(EXIT_FAILURE);
         }
     }
-
-    // slide kv cache window
-    //model->kv_cache_curr = model->kv_cache + 2*C*B*L*curr_iter; 
 
     // cache the inputs/targets
     memcpy(model->inputs, inputs, B * T * sizeof(int));
@@ -766,25 +678,25 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T, si
 
         // now do the forward pass
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
-        //printf("finished layernorm\n");
-        int num_new_kvs = 1;
-        if (use_kv_cache) { // is indexing per layer going to be weird?
-            matmul_cached(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
-            //populate_kv_cache(model->kv_cache_curr, l_qkv, B, T, C, T-1);    // add last token to cache
 
-            // okay so for now, we're just copying the cached values into l_qkv for use in attention_forward
-            // in the future this copying will not happen -- the attention_forward will be block-wise
-            //fill_from_kv_cache(l_qkv, model->kv_cache_curr, B, T, C);
-        } else {
+        int kv_start;
+        if (first_pass) { // need to update first pass logic because won't work with multiple rounds of prompts 
+        // and actually I think this is probably why we need to have the first pass be like, a full first pass so we can set it appropriately
+        // maybe you could just set the flag per new prompt I guess
             // only called the first time, to populate the cache
             matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
-            //populate_kv_cache(model->kv_cache_curr, l_qkv, B, T, C, 0);
-            num_new_kvs = T;
+            kv_start = 0;
+        } else {
+            matmul_cached(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
+            kv_start = T-1;
         }
 
-        add_to_cache(model->manager, l_qkv, num_new_kvs); 
+        add_to_cache(model->manager, l_qkv, B, T, C, kv_start);
 
-        paged_attention(l_atty, l_preatt, l_att, l_qkv, B, T, C, NH);
+        int num_blocks; // I'm leaving this alone but don't think I need it for now
+        float*** kv_blocks = collect_kv_blocks(model->manager, 0, &num_blocks);
+
+        attention_paged(l_atty, l_preatt, l_att, l_qkv, kv_blocks[0], kv_blocks[1], B, T, C, NH, curr_iter);
         matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
         residual_forward(l_residual2, residual, l_attproj, B*T*C);
         layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
@@ -1026,9 +938,10 @@ int main(int arc, char **argv) {
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
 
-    int T = 30; // sequence length
+    int T = 32; // sequence length, fits in one block size
     int P = 5; // parallel generations, not using this for now
     int B = 1;
+    int PROMPT_SIZE = 32;
 
     char* tiny_stories_val = "data/TinyStories_val.bin";
     char* tiny_shakespeare_val = "data/tiny_shakespeare_val.bin";
@@ -1036,7 +949,7 @@ int main(int arc, char **argv) {
     DataLoader val_loader;
     dataloader_init(&val_loader, val_tokens, B, T);
     printf("val dataset num_batches: %d\n", val_loader.num_batches);
-    int val_num_batches = 10;
+    //int val_num_batches = 10;
 
     // build the Tokenizer
     Tokenizer tokenizer;
@@ -1045,24 +958,20 @@ int main(int arc, char **argv) {
     // some memory for generating samples from the model
     unsigned long long rng_state = 1337;
     int* gen_tokens = (int*)malloc(B * T * sizeof(int));
-    const int totalSize = 300; // number of steps of inference we will do
+    const int totalSize = 35;//300; // number of steps of inference we will do
     // genT can be larger than T if we slide the window
 
-
-    int L = model.config.num_layers;
     int C = model.config.channels;
-    int C3 = C * 3;
-    int C2 = C * 2;
-    
-    // not stoachstic 
-
-    int PROMPT_SIZE = 30;
 
     printf("T (sequence length): %d\n", T);
     printf("PROMPT_SIZE: %d\n", PROMPT_SIZE);
     printf("totalSize: %d\n", totalSize);
 
-    BlockManager* block_manager = create_block_manager();
+    BlockManager* block_manager = create_block_manager(C);
+    model.manager = block_manager;
+    printf(" ------ State before running -------\n");
+    print_state(block_manager, 0);
+    
     // prompt idx = idx within batch
     // for now, it's always 1
     // maybe need to consider how this works with more in the dataloader
@@ -1145,10 +1054,11 @@ int main(int arc, char **argv) {
             // }
             const char* token_str = tokenizer_decode(&tokenizer, next_token);
             safe_printf(token_str);
+            printf("\n"); // this might fuck it up be careful
             // printf("\n======================================\n");
         } else {
             // fall back to printing the token id
-            printf("%d ", next_token);
+            printf("%d", next_token);
         }
         fflush(stdout);
     }
@@ -1158,7 +1068,7 @@ int main(int arc, char **argv) {
 
     clock_gettime(CLOCK_MONOTONIC, &end);
     double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-    printf("Generating with no caching took (took %f ms)\n", time_elapsed_s * 1000);
+    printf("Generating with paged caching took (took %f ms)\n", time_elapsed_s * 1000);
     
 
     // free
